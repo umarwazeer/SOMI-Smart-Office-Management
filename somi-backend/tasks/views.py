@@ -1,0 +1,323 @@
+from django.utils import timezone
+
+from rest_framework import generics, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from accounts.permissions import IsAdmin, IsManager
+from notifications.models import Notification
+
+from .models import Task
+from .serializers import TaskSerializer
+
+
+class TaskListCreateView(generics.ListCreateAPIView):
+    serializer_class = TaskSerializer
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsManager()]
+
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        user = self.request.user
+
+        queryset = Task.objects.select_related(
+            "assigned_to",
+            "assigned_to__user",
+            "assigned_to__department",
+        )
+
+        # Employees can only see their own assigned tasks.
+        if user.role == "EMPLOYEE":
+            queryset = queryset.filter(
+                assigned_to__user=user
+            )
+
+        search = self.request.query_params.get(
+            "search"
+        )
+
+        status_filter = self.request.query_params.get(
+            "status"
+        )
+
+        priority = self.request.query_params.get(
+            "priority"
+        )
+
+        employee = self.request.query_params.get(
+            "employee"
+        )
+
+        department = self.request.query_params.get(
+            "department"
+        )
+
+        due_from = self.request.query_params.get(
+            "due_from"
+        )
+
+        due_to = self.request.query_params.get(
+            "due_to"
+        )
+
+        if search:
+            queryset = queryset.filter(
+                title__icontains=search
+            ) | queryset.filter(
+                description__icontains=search
+            ) | queryset.filter(
+                assigned_to__employee_id__icontains=search
+            ) | queryset.filter(
+                assigned_to__user__username__icontains=search
+            ) | queryset.filter(
+                assigned_to__user__first_name__icontains=search
+            ) | queryset.filter(
+                assigned_to__user__last_name__icontains=search
+            )
+
+        if status_filter:
+            queryset = queryset.filter(
+                status=status_filter
+            )
+
+        if priority:
+            queryset = queryset.filter(
+                priority=priority
+            )
+
+        if employee:
+            queryset = queryset.filter(
+                assigned_to_id=employee
+            )
+
+        if department:
+            queryset = queryset.filter(
+                assigned_to__department_id=department
+            )
+
+        if due_from:
+            queryset = queryset.filter(
+                due_date__gte=due_from
+            )
+
+        if due_to:
+            queryset = queryset.filter(
+                due_date__lte=due_to
+            )
+
+        return queryset.distinct()
+
+    def perform_create(self, serializer):
+        assigned_to = serializer.validated_data.get(
+            "assigned_to"
+        )
+
+        if not assigned_to:
+            raise ValidationError({
+                "assigned_to": (
+                    "An employee must be assigned "
+                    "to the task."
+                )
+            })
+
+        if assigned_to.status == "INACTIVE":
+            raise ValidationError({
+                "assigned_to": (
+                    "Cannot assign a task to "
+                    "an inactive employee."
+                )
+            })
+
+        task = serializer.save()
+
+        # Notify the assigned employee.
+        Notification.objects.create(
+            user=assigned_to.user,
+            notification_type="TASK",
+            title="New Task Assigned",
+            message=(
+                f'You have been assigned a new task: '
+                f'"{task.title}".'
+            ),
+            related_id=task.id,
+        )
+
+
+class TaskDetailView(
+    generics.RetrieveUpdateDestroyAPIView
+):
+    serializer_class = TaskSerializer
+
+    def get_permissions(self):
+        if self.request.method == "DELETE":
+            return [IsAdmin()]
+
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        user = self.request.user
+
+        queryset = Task.objects.select_related(
+            "assigned_to",
+            "assigned_to__user",
+            "assigned_to__department",
+        )
+
+        if user.role == "EMPLOYEE":
+            queryset = queryset.filter(
+                assigned_to__user=user
+            )
+
+        return queryset
+
+    def update(self, request, *args, **kwargs):
+        task = self.get_object()
+
+        # Employees can update their own task progress,
+        # but cannot reassign the task or change core
+        # management fields.
+        if request.user.role == "EMPLOYEE":
+            allowed_fields = {
+                "status",
+                "description",
+                "actual_hours",
+            }
+
+            submitted_fields = set(
+                request.data.keys()
+            )
+
+            restricted_fields = (
+                submitted_fields - allowed_fields
+            )
+
+            if restricted_fields:
+                return Response(
+                    {
+                        "detail": (
+                            "Employees can only update "
+                            "task progress fields."
+                        ),
+                        "restricted_fields": sorted(
+                            restricted_fields
+                        ),
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            requested_status = request.data.get(
+                "status"
+            )
+
+            if requested_status == Task.Status.COMPLETED:
+                request_data = request.data.copy()
+
+                if not task.completed_at:
+                    request_data["completed_at"] = (
+                        timezone.now()
+                    )
+
+                serializer = self.get_serializer(
+                    task,
+                    data=request_data,
+                    partial=True,
+                )
+
+                serializer.is_valid(
+                    raise_exception=True
+                )
+
+                serializer.save(
+                    completed_at=timezone.now()
+                )
+
+                self._create_status_notification(
+                    task,
+                    Task.Status.COMPLETED,
+                )
+
+                return Response(
+                    serializer.data
+                )
+
+        return super().update(
+            request,
+            *args,
+            **kwargs,
+        )
+
+    def perform_update(self, serializer):
+        task = self.get_object()
+
+        old_status = task.status
+
+        new_status = serializer.validated_data.get(
+            "status"
+        )
+
+        if (
+            new_status == Task.Status.COMPLETED
+            and not task.completed_at
+        ):
+            serializer.save(
+                completed_at=timezone.now()
+            )
+        elif (
+            new_status
+            and new_status != Task.Status.COMPLETED
+            and task.completed_at
+        ):
+            serializer.save(
+                completed_at=None
+            )
+        else:
+            serializer.save()
+
+        if new_status and new_status != old_status:
+            self._create_status_notification(
+                task,
+                new_status,
+            )
+
+    def _create_status_notification(
+        self,
+        task,
+        new_status,
+    ):
+        status_labels = {
+            Task.Status.TODO: "To Do",
+            Task.Status.IN_PROGRESS: "In Progress",
+            Task.Status.REVIEW: "Review",
+            Task.Status.COMPLETED: "Completed",
+            Task.Status.CANCELLED: "Cancelled",
+        }
+
+        status_label = status_labels.get(
+            new_status,
+            new_status,
+        )
+
+        if new_status == Task.Status.COMPLETED:
+            title = "Task Completed"
+            message = (
+                f'Your task "{task.title}" '
+                f'has been completed.'
+            )
+        else:
+            title = "Task Status Updated"
+            message = (
+                f'Your task "{task.title}" '
+                f'is now {status_label}.'
+            )
+
+        Notification.objects.create(
+            user=task.assigned_to.user,
+            notification_type="TASK",
+            title=title,
+            message=message,
+            related_id=task.id,
+        )

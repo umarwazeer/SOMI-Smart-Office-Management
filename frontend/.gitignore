@@ -1,0 +1,12 @@
+# Node modules directory
+node_modules/
+
+# Python compiled files
+*.pyc
+__pycache__/
+
+# Virtual environment
+venv/
+
+# Environment variables file
+.env
