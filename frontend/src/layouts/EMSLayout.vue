@@ -339,6 +339,24 @@
   </q-item-section>
 </q-item>
 
+
+<!-- AI Assistant -->
+<q-item
+  clickable
+  v-ripple
+  to="/ai-assistant"
+  active-class="nav-item-active"
+>
+  <q-item-section avatar>
+    <q-icon name="smart_toy" />
+  </q-item-section>
+
+  <q-item-section>
+    <q-item-label>AI Assistant</q-item-label>
+    <q-item-label caption>Ask SOMI AI</q-item-label>
+  </q-item-section>
+</q-item>
+
             <!-- Management section -->
             <template v-if="canManage">
 

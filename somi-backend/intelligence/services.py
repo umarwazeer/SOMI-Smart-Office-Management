@@ -59,6 +59,107 @@ class IntelligenceEngine:
             "MANAGER",
         ]
 
+    def _performance_visibility_queryset(self, reviews):
+        """
+        Apply role-aware visibility to employee-level
+        performance information.
+
+        ADMIN:
+            Can view all performance information.
+
+        MANAGER:
+            Can view all performance information currently
+            available to the intelligence layer. A future
+            manager-department relation can make this more
+            restrictive.
+
+        EMPLOYEE:
+            Can only view their own performance information.
+        """
+
+        if not self.user:
+            return reviews.none()
+
+        role = getattr(self.user, "role", None)
+
+        if role in ["ADMIN", "MANAGER"]:
+            return reviews
+
+        if role == "EMPLOYEE":
+            return reviews.filter(
+                employee__user=self.user
+            )
+
+        return reviews.none()
+
+    @staticmethod
+    def _performance_attention_reasons(
+        rating,
+        goals_score,
+        productivity_score,
+        quality_score,
+        teamwork_score,
+        communication_score,
+        average_rating,
+    ):
+        """
+        Generate transparent, evidence-based reasons.
+
+        SOMI does not label an employee as 'bad'.
+        It identifies measurable areas that may need attention.
+        """
+
+        reasons = []
+
+        if rating < average_rating:
+            reasons.append(
+                "Overall rating is below the available average."
+            )
+
+        score_fields = [
+            (
+                "Goals",
+                goals_score,
+            ),
+            (
+                "Productivity",
+                productivity_score,
+            ),
+            (
+                "Quality",
+                quality_score,
+            ),
+            (
+                "Teamwork",
+                teamwork_score,
+            ),
+            (
+                "Communication",
+                communication_score,
+            ),
+        ]
+
+        low_score_areas = [
+            name
+            for name, score in score_fields
+            if score < 3.0
+        ]
+
+        if low_score_areas:
+            reasons.append(
+                "Low score areas: "
+                + ", ".join(low_score_areas)
+                + "."
+            )
+
+        if rating < 3.0:
+            reasons.append(
+                "Overall rating is below the "
+                "3.0 monitoring threshold."
+            )
+
+        return reasons
+
     # ---------------------------------------------------------
     # OFFICE OVERVIEW
     # ---------------------------------------------------------
@@ -586,6 +687,153 @@ class IntelligenceEngine:
                 }
             )
 
+        # -----------------------------------------------------
+        # EMPLOYEE-LEVEL PERFORMANCE INTELLIGENCE
+        # -----------------------------------------------------
+        #
+        # This section provides controlled employee-level
+        # performance information for the AI Assistant.
+        #
+        # The LLM does not query PerformanceReview directly.
+        # It receives only this structured intelligence.
+        # -----------------------------------------------------
+
+        employee_insights = []
+
+        visible_reviews = (
+            self._performance_visibility_queryset(
+                reviews
+            )
+            .select_related(
+                "employee__user",
+                "employee__department",
+            )
+            .order_by(
+                "employee_id",
+                "-review_date",
+                "-created_at",
+            )
+        )
+
+        # Use the latest review for each employee so that
+        # an employee is not repeated multiple times when
+        # several historical reviews exist.
+        latest_reviews = {}
+        for review in visible_reviews:
+            employee_id = review.employee_id
+
+            if employee_id not in latest_reviews:
+                latest_reviews[employee_id] = review
+
+        available_average = self._decimal_to_float(
+            averages["rating"]
+        )
+
+        for review in latest_reviews.values():
+            employee = review.employee
+
+            first_name = (
+                employee.user.first_name
+                or ""
+            )
+
+            last_name = (
+                employee.user.last_name
+                or ""
+            )
+
+            employee_name = (
+                f"{first_name} {last_name}"
+            ).strip()
+
+            if not employee_name:
+                employee_name = (
+                    employee.user.username
+                )
+
+            rating = self._decimal_to_float(
+                review.rating
+            )
+
+            goals_score = self._decimal_to_float(
+                review.goals_score
+            )
+
+            productivity_score = (
+                self._decimal_to_float(
+                    review.productivity_score
+                )
+            )
+
+            quality_score = self._decimal_to_float(
+                review.quality_score
+            )
+
+            teamwork_score = self._decimal_to_float(
+                review.teamwork_score
+            )
+
+            communication_score = (
+                self._decimal_to_float(
+                    review.communication_score
+                )
+            )
+
+            reasons = self._performance_attention_reasons(
+                rating=rating,
+                goals_score=goals_score,
+                productivity_score=productivity_score,
+                quality_score=quality_score,
+                teamwork_score=teamwork_score,
+                communication_score=communication_score,
+                average_rating=available_average,
+            )
+
+            attention = bool(reasons)
+
+            employee_insights.append(
+                {
+                    "employee_id": employee.id,
+                    "employee_code": employee.employee_id,
+                    "employee_name": employee_name,
+                    "department": (
+                        employee.department.name
+                        if employee.department
+                        else "Unassigned"
+                    ),
+                    "job_title": employee.job_title,
+                    "review_date": review.review_date,
+                    "review_period": review.review_period,
+                    "status": review.status,
+                    "rating": rating,
+                    "goals_score": goals_score,
+                    "productivity_score": productivity_score,
+                    "quality_score": quality_score,
+                    "teamwork_score": teamwork_score,
+                    "communication_score": (
+                        communication_score
+                    ),
+                    "strengths": (
+                        review.strengths or ""
+                    ),
+                    "improvement_areas": (
+                        review.improvement_areas or ""
+                    ),
+                    "manager_feedback": (
+                        review.manager_feedback or ""
+                    ),
+                    "attention": attention,
+                    "attention_reasons": reasons,
+                }
+            )
+
+        employee_insights.sort(
+            key=lambda item: (
+                not item["attention"],
+                item["rating"],
+            )
+        )
+
         return {
             "total_reviews": total,
             "draft": draft,
@@ -596,6 +844,15 @@ class IntelligenceEngine:
                 for key, value in averages.items()
             },
             "department_breakdown": department_breakdown,
+            "employee_insights": employee_insights,
+            "employee_insights_available": bool(
+                employee_insights
+            ),
+            "employee_insights_note": (
+                "Employee-level performance information "
+                "is filtered according to the authenticated "
+                "user's role."
+            ),
             "alerts": alerts,
         }
 

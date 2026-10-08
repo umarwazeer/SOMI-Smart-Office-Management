@@ -132,6 +132,11 @@ const routes = [
       },
 
       {
+        path: 'ai-assistant',
+        component: () => import('src/pages/component/intelligence/AIAssistant.vue')
+      },
+
+      {
         path: 'EmployeeDetails/:id',
         component: () => import('src/pages/component/EmployeeReports/EmployeeDetails.vue')
       },
